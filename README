@@ -1,0 +1,49 @@
+This is a Perl program that can be used to print texts on labels and
+envelopes. It generates PostScript output.
+
+Features:
+
+  - label and envelope formats can be defined in a configuration file
+  - repeating text on labels
+  - multi-pass printing of label sheets
+  - prints KIX barcodes for dutch addresses
+
+Installation: unpack the kit, and type the following commands in the
+directory created by unpacking:
+
+    perl Makefile.PL
+    make all test
+
+This program requires PostScript::Font version 1.03 or later.
+It requires a Unix PostScript Resources file (.upr) to find the
+necessary info for the fonts used. Adapt times.upr to your local
+situation, and type:
+
+    make all test
+
+Now tailor blib/script/labels if needed:
+
+  - Change the location of the site configuration file. This is
+    pre-set to "/usr/local/lib/labels.cfg".
+
+Now type "make install". Note that this command usually requires super
+user privilege.
+
+Inspect and edit the configuration file labels.cfg, and place it in
+a location where the program can find it. The program looks for a
+configuration file in one of the following places:
+
+    .labels.cfg
+    $HOME/.labels.cfg
+    /usr/local/lib/labels.cfg
+
+The first non-empty file found will be used.
+
+Have fun!
+
+----------------------------------------------------------------------------
+Johan Vromans                                           jvromans@squirrel.nl
+Squirrel Consultancy                                Haarlem, the Netherlands
+http://www.squirrel.nl                http://www.squirrel.nl/people/jvromans
+PGP Key 2048/4783B14D     http://www.squirrel.nl/people/jvromans/pgpkey.html
+----------------------- "Arms are made for hugging" ------------------------

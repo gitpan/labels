@@ -1,0 +1,17 @@
+PS-Resources-1.0
+FontAFM
+FontOutline
+.
+//home/jv/lib/fonts/
+FontAFM
+Times-Roman=afmetrics/t/time0003
+Times-Bold=afmetrics/t/time0000
+Times-Italic=afmetrics/t/time0002
+Times-BoldItalic=afmetrics/t/time0001
+.
+FontOutline
+Times-Roman=t1fonts/t/time0003
+Times-Bold=t1fonts/t/time0000
+Times-Italic=t1fonts/t/time0002
+Times-BoldItalic=t1fonts/t/time0001
+.

@@ -1,0 +1,1300 @@
+#!/usr/bin/perl -w
+my $RCS_Id = '$Id: labels.pl 1.30 2001-02-18 13:24:25+01 jv Exp $ ';
+
+# Author          : Johan Vromans
+# Created On      : Tue Sep 15 15:59:04 1992
+# Last Modified By: Johan Vromans
+# Last Modified On: Sun Feb 18 13:24:21 2001
+# Update Count    : 672
+# Status          : Unknown, Use with caution!
+
+################ Common stuff ################
+
+use strict;
+use Getopt::Long;
+use Text::ParseWords;
+use IO;
+use PostScript::Resources;
+use PostScript::BasicTypesetter;
+use PostScript::PseudoISO;
+
+# For MakeMaker
+my $VERSION;
+($VERSION) = '$Revision: 1.30 $ ' =~ /: ([\d.]+)/;
+
+my $LIBDIR = "/usr/local/lib";
+my ($my_package, $my_name, $my_version) = ('Sciurix', $1, $VERSION)
+  if $RCS_Id =~ /: (.+)\.pl/;
+$my_version .= '*' if length('$Locker:  $ ') > 12;
+
+################ Program parameters ################
+
+# Settings that can come from the config file as well as the command line.
+my $cfg_bottommargin = 0;	# offset from the bottom of the page
+my $cfg_cols = 1;		# number of columns per page
+my $cfg_orientation = 0;	# page orientation
+my $cfg_left = 0;		# offset from the left of the label
+my $cfg_leftmargin = 0;		# offset from the left of the page
+my $cfg_rightmargin = 0;	# offset from the right of the page
+my $cfg_papersize = "a4";	# paper size
+my $cfg_preamble;		# PostScript preamble
+my $cfg_rows = 1;		# number of rows per page
+my $cfg_top = 0;		# offset from the top of the label
+my $cfg_hcenter = 0;		# center horizontally
+my $cfg_vcenter = 0;		# center vertically
+my $cfg_topmargin = 0;		# offset from the top of the page
+my @cfg_options = (
+	   "bottommargin=f",	\$cfg_bottommargin,
+	   "cols=i",		\$cfg_cols,
+	   "landscape",		sub { $cfg_orientation = 1 },
+	   "left=f",		\$cfg_left,
+	   "leftmargin=f",	\$cfg_leftmargin,
+	   "papersize=s",	\$cfg_papersize,
+	   "preamble=s",	\$cfg_preamble,
+	   "portrait",		sub { $cfg_orientation = 0 },
+	   "rightmargin=f",	\$cfg_rightmargin,
+	   "rows=i",		\$cfg_rows,
+	   "seascape",		sub { $cfg_orientation = 3 },
+	   "top=f",		\$cfg_top,
+	   "topmargin=f",	\$cfg_topmargin,
+	   "upsidedown",	sub { $cfg_orientation = 2 },
+	   "hcenter",		\$cfg_hcenter,
+	   "vcenter",		\$cfg_vcenter,
+		  );
+
+# Settings that can come from the command line only.
+my $opt_config;			# alternate config file
+my $opt_debug = 0;		# debugging info
+my $opt_interline = 14;		# space between lines, in PS points
+my $opt_fontsize = 10;		# font size
+my $opt_kix = 0;		# process KIX codes
+my $opt_manual = 0;		# print using manual feed
+my $opt_output;			# desired output file
+my $opt_repeat = 1;		# repeat each label entry
+my $opt_start = 1;		# start at label position
+my $opt_test = 0;		# testing only
+my $opt_type;			# label type
+my $opt_verbose = 0;		# verbose info
+my $opt_layout = 0;		# show layout
+my @opt_options = (
+	   "config=s",		\$opt_config,
+	   "debug",		\$opt_debug,
+	   "interline=i",	\$opt_interline,
+	   "fontsize=f",	\$opt_fontsize,
+	   "kix!",		\$opt_kix,
+	   "layout",		\$opt_layout,
+	   "manual",		\$opt_manual,
+	   "output=s",		\$opt_output,
+	   "repeat=i",		\$opt_repeat,
+	   "start=i",		\$opt_start,
+	   "test",		\$opt_test,
+	   "type=s",		\$opt_type,
+	   "verbose",		\$opt_verbose,
+		  );
+options ();
+$opt_verbose |= $opt_debug;
+
+################ Configuration ################
+
+my $x_disp = 0;			# displacement per label, in PS points
+my $y_disp = 0;			# displacement per label, in PS points
+my $page_height = 0;		# physical page height, in PS points
+my $page_width = 0;		# physical page width, in PS points
+my $cols = 0;			# number of columns per page
+my $rows = 0;			# number of rows per page
+
+# Paper formats (dimensions in mm).
+my %pagetbl = ( a4 => [ 210, 297 ], letter => [ 8.5*25.4, 11*25.4 ] );
+
+# Font 0: Normal print
+# Font 1: Italic font
+# Font 2: Bold font
+# Font 3: Bold-Italic font
+my @fonts = qw(Times-Roman Times-Italic
+               Times-Bold Times-BoldItalic);
+
+my $psres;
+my %tsmap;
+my ($ts_any, $ts_rm, $ts_bd, $ts_bi, $ts_it);
+
+my $def_config = "labels.cfg";
+my @config_paths = ( './.', $ENV{'HOME'}.'/.', $LIBDIR.'/' );
+configure ();
+
+# Starting label# on this page. Allows to restart with a paper
+# of which some of the labels have already been used.
+my $label = $opt_start ? $opt_start-1 : 0;
+
+my $page = 0;			# current page number
+
+open (STDOUT, ">$opt_output") if defined $opt_output;
+
+################ The Process ################
+
+# Input format
+#
+# Series of lines, separated by an empty line, e.g.:
+#
+#    John Johanson
+#    Mainstreet 44
+#    1234 AB Somewhere
+#
+# The last line of a series may be an explicit KIX code, e.g.:
+#
+#    1234AB44
+#
+# If no explicit KIX code is supplied, a code is deduced from the address.
+#
+# Lines should not be indented.
+
+
+my @input = ();
+local ($/) = "";		# paragraph mode
+  while ( <> ) {
+
+    # Split into lines.
+    my @lines = split (/\n/);
+    printf STDERR ("%3d: %s\n", $label+1, $lines[0]) if $opt_verbose;
+
+    # Prescan for fonts and create typesetters.
+    foreach ( @lines ) {
+	my $ts;
+	my $t;
+	if ( m/^(\/\||\|\/)(.*)/ ) {
+	    $ts = $ts_bi ||= ps_typesetter($fonts[3]);
+	    $t = $2;
+	}
+	elsif ( m|^//(.*)| ) {
+	    $ts = $ts_it ||= ps_typesetter($fonts[1]);
+	    $t = $1;
+	}
+	elsif ( m|^[\|]{2}(.*)| ) {
+	    $ts = $ts_bd ||= ps_typesetter($fonts[2]);
+	    $t = $1;
+	}
+	else {
+	    $ts = $ts_rm ||= ps_typesetter($fonts[0]);
+	    $t = $_;
+	}
+	$_ = [ $ts, PostScript::PseudoISO->prepstr($t) ];
+	$ts_any = $ts;
+    }
+    push (@input, [@lines]);
+}
+
+foreach my $data ( @input ) {
+    foreach ( 1..$opt_repeat ) {
+	# Form label from selected element.
+	add_label (@$data);
+    }
+}
+
+flush_labels ();
+trailer () if $page;
+print STDERR ("Number of pages = $page\n") if $opt_verbose;
+
+################ Subroutines ################
+
+sub psp {
+    # mm -> PostScript points
+    72.0/25.4*shift;
+}
+
+sub add_label {
+    my (@lines) = @_;
+    local ($_);
+    my $width = $x_disp - $cfg_left - 20;
+    if ( $opt_debug ) {
+	print STDERR ("New label:\n");
+	foreach ( @lines ) {
+	    printf STDERR ("-%2d-> \"%s\"\n", $label+1, $_);
+	}
+    }
+
+    # Position the label.
+    my $y = $page_height - $cfg_topmargin - int($label/$cols)*$y_disp;
+    my $x = $cfg_leftmargin + int($label%$cols)*$x_disp;
+    $x += $cfg_left unless $cfg_hcenter;
+    $y -= $cfg_top unless $cfg_vcenter;
+
+    newpage () if $label == 0 || $page == 0;
+
+    # Generate PostScript strings.
+    print STDOUT ("% Label ", $label+1, "\n");
+
+    # Special treatment for KIX code, if present.
+    my $kix_code;
+    if ( $opt_kix ) {		# can do
+	# If the last line matches 1234AB56..., it's the KIX
+	if ( $lines[-1]->[1] =~ /^(\d{4}[A-Z]{2}\d+(X[A-Z0-9]+)?)\s*$/ ) {
+	    $kix_code = pop (@lines)->[1];
+	}
+	# Else try to infer from the address.
+	# Check for a dutch zip code "1234 AB"...
+	elsif ( $lines[-1]->[1] =~ /^(\d{4})\s+([A-Z]{2})\s+/ ) {
+	    $kix_code = $1.$2;
+	    # Check if we have a street number
+	    if ( @lines > 1 && $lines[-2]->[1] =~ /\s+(\d+)(i+)?\s*$/ ) {
+		$kix_code .= $1;
+		$kix_code .= "X" . uc($2) if defined $2;
+		print STDERR ("KIX code: $kix_code\n") if $opt_verbose;
+	    }
+	    else {
+		$kix_code = undef;
+	    }
+	}
+	print STDERR ("Warning[label ", $label+1, "]: ".
+		      "Could not distill KIX code\n")
+	  unless defined $kix_code;
+    }
+
+    if ( $cfg_hcenter || $cfg_vcenter ) {
+	my $w = 0;
+	my $yy = 0;
+	foreach ( @lines ) {
+	    $_->[0]->ps_textbox (0, 0, \$yy, $x_disp-20, [$_->[1]]);
+	    $yy -= $opt_interline;
+	    $w = $_->[0]->textwidth if $_->[0]->textwidth > $w;
+	}
+	$yy = -$yy;
+	print STDERR ("dim: max x = $w, max y = ",
+		      $yy/$opt_interline, ", width = $x_disp,",
+		      " height = $y_disp\n") if $opt_debug;
+	$ts_any->ps_setfont(undef); # flush cache
+
+	if ( $cfg_vcenter ) {
+	    my $asc = 0.7 * $opt_fontsize;
+	    my $h = $yy;
+	    $y -= $asc + ($y_disp - $h) /2;
+	    $y += 1.5*$opt_interline/2 if defined $kix_code;
+	}
+	if ( $cfg_hcenter ) {
+	    # Center around current $x position.
+	    $width = $x_disp - 20;
+	    $x += ($x_disp-$w)/2;
+	}
+    }
+
+    printf STDERR ("Position: x = %g, y = %g\n", $x, $y) if $opt_debug;
+
+    # Print the lines.
+    foreach ( @lines ) {
+	my $ts = shift(@$_);
+	print STDOUT
+	  ($ts->ps_textbox ($x, 0, \$y, $width, $_->[0]));
+	$y -= $opt_interline;
+    }
+
+    # Add the KIX code.
+    if ( defined $kix_code ) {
+	$y -= psp(2);
+	printf STDOUT ("%g %g m (%s) kix\n", $x, $y, $kix_code);
+    }
+
+    # Advance.
+    $label++;
+    if ( $label >= ($rows * $cols) ) {
+	flush_labels ();
+	$label = 0;
+	$ts_any->ps_setfont(undef);
+    }
+}
+
+sub flush_labels {
+    return unless $label > 0 || ($page == 0 && $opt_layout);
+    print STDOUT ("showpage restore end\n");
+}
+
+sub ps_typesetter {
+    my ($font) = @_;
+    local ($/) = "\n";		# outer loop uses para mode
+    $psres ||= new PostScript::Resources;
+    my $ts = $tsmap{$font};
+    unless ( defined $ts ) {
+	my $metrics = $psres->FontAFM($font);
+	die ("Unknown font: $font\n") unless $metrics;
+	$metrics = new PostScript::FontMetrics ($metrics);
+	$tsmap{$font} = $ts = new PostScript::BasicTypesetter ($metrics);
+	$ts->reencode("ISOLatin1Encoding", "Latin1",
+		      PostScript::PseudoISO->reencodingvector);
+    }
+    else {
+	$ts = $ts->clone;
+    }
+    $ts->fontsize($opt_fontsize, $opt_interline);
+    $ts;
+}
+
+# Generate the preamble. Standard preamble follows the source.
+sub preamble {
+    return if $opt_test;
+    local ($/) = "\n";		# outer loop uses para mode
+
+    if ( $cfg_preamble ) {
+	open (DATA, $cfg_preamble)
+	    || die ("Cannot read $cfg_preamble [$!]\n");
+    }
+
+    while ( <DATA> ) {
+	# Update %%Creator info.
+	if ( /^%%Creator:/ ) {
+	    $_ = "%%Creator: $my_name $my_version by Johan Vromans\n";
+	    $_ .= "%%Created: " . localtime(time) . "\n";
+	}
+
+	# Substitute font names.
+	if ( /^FONTPREAMBLE$/s ) {
+	    print STDOUT ($ts_any->ps_preamble,
+			  $ts_any->ps_reencodesub(base=>"ISOLatin1Encoding"));
+	    next;
+	}
+	if ( /^FONTSETUPS$/s ) {
+	    foreach my $f (values %tsmap) {
+		print STDOUT ($f->ps_reencode);
+	    }
+	    next;
+	}
+	if ( /^(.*?)FONTLIST(.*)$/s ) {
+	    foreach my $f (values %tsmap) {
+		print STDOUT ("$1", $f->real_fontname, "$2");
+	    }
+	    next;
+	}
+
+	# Omit the lines for KIX if kix processing is not enabled.
+	if ( !$opt_kix ) {
+	    next if /^%%BeginResource: font KIX/ .. /^%%EndResource/;
+	    next if /kix/i;
+	}
+
+	# Insert layout, if required.
+	if ( $opt_layout && m|^/layout | ) {
+	    insert_layout ();
+	    next;
+	}
+
+	# Print unless it is a single %-line (and not the 1st %! line).
+	print STDOUT $_ unless /^%[^%!]/;
+    }
+
+    # Add features.
+    print STDOUT ("%%BeginFeature: *InputSlot Manual feed\n",
+		  "statusdict /manualfeed true put\n",
+		  "%%EndFeature\n")
+      if $opt_manual;
+    printf STDOUT ("%%%%BeginFeature: *PageSize %s\n".
+		   "<< /DeferredMediaSelection true\n".
+		   "   /PageSize [%g %g] %% %g %g\n".
+		   "   /ImagingBBox null >> setpagedevice\n".
+		   "%%%%EndFeature\n",
+		   ( $cfg_papersize =~ /^_/ ) ? "UserDefined"
+		   : ucfirst($cfg_papersize),
+		   psp($pagetbl{$cfg_papersize}->[0]),
+		   psp($pagetbl{$cfg_papersize}->[1]),
+		   $page_width, $page_height);
+
+    # End preamble.
+    print STDOUT ("%%EndSetup\n");
+}
+
+sub newpage {
+    preamble () if $page == 0;
+    $page++;
+    print STDOUT ("\n",
+		  "%%Page: ", $page, " ", $page, "\n",
+		  "%%BeginPageSetup\n",
+		  "WorkDict begin save\n");
+    if ( $cfg_orientation == 1 ) {
+	printf STDOUT ("%g %g translate 90 rotate\n", $page_height, 0);
+    }
+    elsif ( $cfg_orientation == 2 ) {
+	printf STDOUT ("%g %g translate 180 rotate\n",
+		       $page_width, $page_height);
+    }
+    elsif ( $cfg_orientation == 3 ) {
+	printf STDOUT ("%g %g translate -90 rotate\n", 0, $page_width);
+    }
+    print STDOUT ("layout\n") if $opt_layout;
+    print STDOUT ("%%EndPageSetup\n");
+
+}
+
+sub trailer {
+    print STDOUT ("\n",
+		  "%%Trailer\n",
+		  "%%Pages: ", $page, "\n",
+		  "%%EOF\n");
+}
+
+sub configure {
+
+    # Read the config file to determine the page and label parameters.
+    # The config file can contain multiple entries, selectable with
+    # '-type xxx' on the command line.
+    #
+    # Example config file:
+    #
+    # type 21
+    #   cols 3
+    #   rows 7
+    #
+    # type 10
+    #   rows 5
+    #   cols 2
+    #
+    # Additional paper sizes can be defined as well:
+    #
+    # paper A4 297 210 # mm!
+
+    my $do;
+    my $tpat;
+
+    # Try to find a config file.
+    unless ( defined $opt_config ) {
+	foreach my $path ( @config_paths ) {
+	    $opt_config = $path . $def_config;
+	    last if -s $opt_config;
+	}
+	undef $opt_config unless -s $opt_config;
+    }
+
+    # We *NEED* a config file if -type was supplied.
+    if ( defined $opt_type && ! defined $opt_config ) {
+	die ("Could not find a configuration file\n");
+    }
+
+    # Turn type into pattern.
+    unless ( $do = !defined $opt_type ) {
+	$tpat = $opt_type;
+	$tpat =~ s/(\W)/\\$1/g;
+    }
+
+    # Read the config file.
+    if ( defined $opt_config ) {
+	print STDERR ("config = $opt_config\n") if $opt_debug;
+	my $cfg = new IO::File;
+	$cfg->open ("<$opt_config") || die ("$opt_config: $!\n");
+
+	while ( <$cfg> ) {
+	    # Strip comments and newline.
+	    s/\s*#.*$//;
+	    chop;
+	    # Skip empty lines.
+	    next unless /\S/;
+
+	    # Check for "default" type spec.
+	    # Must precede the type specs!
+	    if ( /^\s*default\s+(.+)\b/io ) {
+		unless ( defined $opt_type ) {
+		    $opt_type = $1;
+		    print STDERR ("Using default type \"$opt_type\"\n")
+			if $opt_verbose;
+		    $tpat = $opt_type;
+		    $tpat =~ s/(\W)/\\$1/g;
+		    $do = 0;
+		}
+		next;
+	    }
+
+	    # Page size definitions.
+	    if ( /^\s*paper\s+(\S+)\s+(\d+(\.\d+)?)\s+(\d+(\.\d+)?)/i ) {
+		$pagetbl{lc $1} = [ $2, $4 ];
+		print STDERR ("Paper \"$1\" = $2 x $4 mm\n") if $opt_debug;
+		next;
+	    }
+
+	    # Fonts.
+	    if ( /^\s*fonts\s+(.*)/ ) {
+		my @f = split (' ', $1);
+		@fonts[0..$#f] = @f;
+		next;
+	    }
+	    if ( /^\s*plainfont\s+(\S+)/ ) {
+		$fonts[0] = $1;
+		next;
+	    }
+	    if ( /^\s*italicfont\s+(\S+)/ ) {
+		$fonts[1] = $1;
+		next;
+	    }
+	    if ( /^\s*boldfont\s+(\S+)/ ) {
+		$fonts[2] = $1;
+		next;
+	    }
+	    if ( /^\s*bolditalicfont\s+(\S+)/ ) {
+		$fonts[3] = $1;
+		next;
+	    }
+
+	    # Check for "type" definition.
+	    if ( ! $do ) {	# haven't found one yet
+		if ( /^\s*type\s+$tpat\b/io ) {
+		    # Found.
+		    $do = 1;
+		    print STDERR ("Found description for $_\n") if $opt_debug;
+		}
+		next;
+	    }
+	    else {
+		# Got one already.
+		if ( /^\s*type\s+/i ) {
+		    # Finish.
+		    last;
+		}
+	    }
+	    s/^\s+//;
+	    s/\s+$//;
+	    print STDERR ("cfg: $_\n") if $opt_debug;
+
+	    # Break into words and process like options.
+	    local (@ARGV) = Text::ParseWords::shellwords ($_);
+	    $ARGV[0] = '--' . $ARGV[0] unless $ARGV[0] =~ /^-/;
+	    print STDERR ("opt: \"", join("\" \"", @ARGV), "\"\n")
+	      if $opt_debug;
+	    die ("Error in config file: $_\n")
+		unless GetOptions (@cfg_options) || @ARGV > 0;
+	}
+	$cfg->close;
+    }
+
+    # Need info if type was selected.
+    die ("Could not find config for type $opt_type in $opt_config\n")
+	if defined $opt_type && !$do;
+
+    $rows = $cfg_rows;
+    $cols = $cfg_cols;
+
+    # Dimensions in PostScript coordinates.
+    my $dim = $pagetbl{lc($cfg_papersize)};
+    unless ( defined $dim ) {
+	print STDERR ("Unsupported paper size: $cfg_papersize\n");
+	die ("Supported sizes are @{[sort keys %pagetbl]}\n");
+    }
+    $page_width  = ($cfg_orientation & 1) ? $dim->[1] : $dim->[0];
+    $page_height = ($cfg_orientation & 1) ? $dim->[0] : $dim->[1];
+
+    $x_disp = ($page_width  - $cfg_leftmargin - $cfg_rightmargin) / $cols;
+    $y_disp = ($page_height - $cfg_topmargin - $cfg_bottommargin) / $rows;
+
+    # Transform to PostScript points.
+    foreach ( $cfg_left, $cfg_top, $page_width, $page_height,
+	      $cfg_leftmargin, $cfg_rightmargin, $cfg_topmargin,
+	      $cfg_bottommargin, $x_disp, $y_disp ) {
+	$_ = psp ($_);
+    }
+
+    if ( $opt_debug ) {
+	print STDERR ("orientation = $cfg_orientation\n");
+	foreach ( @cfg_options ) {
+	    if ( ref ) {
+		print STDERR ((ref eq 'SCALAR' && defined $$_) ? $$_ :
+			      "undef", "\n");
+	    }
+	    else {
+		s/[!=].*$//;
+		print STDERR ($_, " = ");
+	    }
+	}
+    }
+
+    die ("Error: start label ($opt_start) exceeds number of labels per " .
+	 "page (" . ($rows*$cols) . ")\n") if $opt_start > $rows*$cols;
+}
+
+sub min { $_[0] < $_[1] ? $_[0] : $_[1]; }
+
+sub insert_layout {
+    # Light grey boxes to represent text lines.
+    printf STDOUT ("/lbx { 0 %g rl %g 0 rl 0 %g rl cpf } def\n",
+		   $opt_interline/2,
+		   min (psp(40),
+			$cols == 1 ? ($page_width-$cfg_left-$cfg_leftmargin)
+			: ($x_disp-2*$cfg_left)),
+		   -$opt_interline/2);
+
+    print STDOUT ("/layout {\n");
+
+    # Draw a light grey area for the page margins.
+    if ( $cfg_topmargin || $cfg_bottommargin ||
+	 $cfg_leftmargin || $cfg_rightmargin ) {
+	printf STDOUT ("  0.9 setgray 0 0 m %g 0 rl 0 %g rl %g 0 rl 0 0 m\n",
+		       $page_width,
+		       $page_height,
+		       -$page_width);
+	printf STDOUT ("  %g %g m 0 %g rl %g 0 rl 0 %g rl cpf\n",
+		       $cfg_leftmargin,
+		       $cfg_bottommargin,
+		       $page_height - ($cfg_topmargin+$cfg_bottommargin),
+		       $page_width - ($cfg_leftmargin+$cfg_rightmargin),
+		       -($page_height - ($cfg_topmargin+$cfg_bottommargin)));
+	printf STDOUT ("  0.6 setgray %g %g m 0 %g rl %g 0 rl stroke\n",
+		       $cfg_leftmargin,
+		       $cfg_bottommargin,
+		       $page_height - ($cfg_topmargin+$cfg_bottommargin),
+		       $page_width - ($cfg_leftmargin+$cfg_rightmargin));
+    }
+    else {
+	print STDOUT ("  0.6 setgray\n");
+    }
+
+    # Separator lines for the columns.
+    foreach my $c ( 1..$cols ) {
+	printf STDOUT ("  %g %g m 0 %g rl stroke\n",
+		       $cfg_leftmargin + $c*$x_disp,
+		       $cfg_bottommargin,
+		       $page_height - ($cfg_topmargin+$cfg_bottommargin));
+    }
+
+    # Separator lines and grey boxes for the rows and cells.
+    foreach my $r ( 0..$rows-1 ) {
+	printf STDOUT ("  0.6 setgray %g %g m %g 0 rl stroke\n",
+		       $cfg_leftmargin,
+		       $cfg_bottommargin + $r*$y_disp,
+		       $page_width - ($cfg_leftmargin+$cfg_rightmargin));
+	my $y = $page_height - $cfg_topmargin - $cfg_top - $r*$y_disp;
+	if ( $cfg_vcenter ) {
+	    $y -= ($y_disp-$cfg_top)/2;
+	    $y += (1.5*$opt_interline)/2;
+	}
+	print STDOUT ("  0.9 setgray\n");
+	foreach my $c ( 0..$cols ) {
+	    my $x = $cfg_left + $cfg_leftmargin + $c*$x_disp;
+	    foreach ( 0..2 ) {
+		printf STDOUT ("  %g %g m lbx\n",
+			       $x,
+			       $y - $_*$opt_interline);
+	    }
+	}
+    }
+
+    print STDOUT ("  0 setgray\n",
+		  "} def\n");
+}
+
+sub options {
+    my $opt_help = 0;	# handled locally
+    my $opt_ident = 0;	# handled locally
+
+    # Process options.
+    usage ()
+      unless GetOptions (@cfg_options,
+			 @opt_options,
+			 "ident",	\$opt_ident,
+			 "help",	\$opt_help,
+			)
+	&& !$opt_help;
+    print STDERR "This is $my_package [$my_name $my_version]\n"
+	if $opt_ident;
+}
+
+sub usage {
+    print STDERR <<EndOfUsage;
+This is $my_name $my_version
+Usage: $0 [options] [file ...]
+    -papersize XX	paper size (a4 or us, default a4)*
+    -portrait		print in portrait mode*
+    -landscape		use landscape printing*
+    -seascape		use seascape printing*
+    -upsidedown		print upsidedown*
+    -rows NN		number of labels vertically*
+    -cols NN		number of labels horizontally*
+    -topmargin NN	top margin labels on page (in mm)*
+    -bottommargin NN	bottom margin labels on page (in mm)*
+    -leftmargin NN	left margin labels on page (in mm)*
+    -rightmargin NN	right margin labels on page (in mm)*
+    -top NN		top margin text on labels (in mm)*
+    -left NN		teft margin text on labels (in mm)*
+    -vcenter		center text vertically*
+    -start NN		start pos for label, upper-left = 1
+    -repeat NN		repeat every label NN times
+    -interline NN	space between lines (in points)
+    -type XXX		label description
+    -config XXX		alternate config file
+    -preamble XXX	alternate postscript preamble*
+    -output XXX		send output to file XXX instead of standard output
+    -manual		print using manual feed
+    -[no]kix		[do not] process KIX codes
+    -layout		show layout
+    -help		this message
+    -ident		show identification
+    -verbose		verbose information
+
+Options marked with * can be specified in the config file.
+EndOfUsage
+    exit 1;
+}
+
+1;
+
+################ Documentation ################
+
+=head1 NAME
+
+labels - print labels and envelopes
+
+=head1 SYNOPSIS
+
+labels [options] [file ...]
+
+=head1 DESCRIPTION
+
+B<labels> will read the given input file(s) and produce a PostScript
+file that can be used to print text labels.
+
+The input is considered to contain the text lines that must be printed
+on the labels. One or more empty lines separate entries.
+
+Example:
+
+    labels -paper a4 -rows 7 -cols 3 -left 10 -vcenter \
+             -start 5 -repeat 3 < file > file.ps
+
+This defines the paper size to be A4 (210 x 297 mm). Each sheet has 21
+labels, arranged in 7 rows of 3 columns. The text on the labels will
+start 10 mm from the left edge of the label, and is vertically
+centered. The first entry printed will occupy label number 5 (top-left
+label is 1, bottom-right label is 21). Each entry is repeated 3 times.
+
+The layout specification can come from the command line, or (much
+easier) from a configuration file. For this example, the configuration
+entry would be:
+
+    type 21
+    paper a4
+    cols 3
+    rows 7
+    left 10
+    vcenter
+
+The command then only needs to select the desired type, start and
+repetition:
+
+    labels -type 21 -start 5 -repeat 3 < file > file.ps
+
+See below for more details.
+
+=head1 COMMAND LINE OPTIONS
+
+This section describes the command line options that do not have a
+counterpart in the configuration file.
+
+=over 4
+
+=item B<-config> I<file>
+
+Designates the name of the configuration file to be used.
+
+=item B<-layout>
+
+Includes a layout drawing in the PostScript file to illustrate how the
+printout will look like. 
+
+=item B<-type> I<XX>
+
+Select the layout specification labeled I<XX> from the configuration file.
+
+=item B<-start> I<NN>
+
+Printing will start at label location I<NN>. This makes it possible to
+print some labels, peel them off, and continue printing on the same
+sheet some time later. First label has number 1 (top-left). The last
+label is the bottom-right one.
+Default is to start at label 1.
+
+=item B<-repeat> I<NN>
+
+Repeat every entry I<NN> times. Default is once.
+
+=item B<-interline> I<NN>
+
+Distance between the baselines of the printed text, in PostScript
+points.
+Default is 14 points. Deprecated.
+
+=item B<-[no]kix>
+
+Enable / disable processing of dutch KIX codes. This is enabled by
+default.
+
+=item B<-output> I<file>
+
+Send output to I<file> instead of standard output.
+
+=item B<-manual>
+
+Print using manual feed.
+
+=item B<-help>
+
+Print a brief help message and exits.
+
+=item B<-ident>
+
+Prints program identification.
+
+=item B<-verbose>
+
+More verbose information.
+
+=back
+
+=head1 CONFIGURATION
+
+The program looks for a configuration file in one of the following
+places:
+
+    .labels.cfg
+    $HOME/.labels.cfg
+    /usr/local/lib/labels.cfg
+
+The first non-empty file found will be used.
+A configuration file is optional, unless the B<-type> command line
+option was used.
+
+Lines starting with C<#> in the configuration file will be ignored.
+Leading and trailing whitespace is ignored as well.
+
+The configuration file can contain the following definitions:
+
+=over 4
+
+=item *
+
+The fonts to use. All fonts can be set in one command:
+
+B<fonts> I<plainfont> I<italicfont> I<boldfont> I<bolditalicfont>
+
+Alternatively, individual fonts can be set with one of the commands
+B<plainfont>, B<italicfont>, B<boldfont> and B<bolditalicfont>, each
+followed by the name of the font.
+For example:
+
+    boldfont Palatino-Bold
+
+The default fonts are Times-Roman, Times-Italic, Times-Bold and
+Times-BoldItalic.
+
+=item *
+
+Paper sizes. The format is I<name> I<width> I<height> (dimensions in
+millimeters).
+For example:
+
+    paper a4 210 297
+
+The name of the paper size must be a recognized PostScript paper size,
+unless it starts with an C<_> character. In this case, the page
+dimensions will be registered in the PostScript output.
+
+Paper sizes `a4' (European A4) and `letter' (US Letter) are predefined.
+
+=item *
+
+The default layout specification to use, e.g.
+
+    default 21
+
+This will always select the specification labeled 21 unless overridden
+with a B<-type> command line option.
+
+=item *
+
+A layout specification.
+
+=back
+
+All specifications can also be given as command line arguments.
+However, the values in the configuration file override the command
+line arguments.
+
+=over 4
+
+=item B<type> I<name>
+
+This identifies the following specification with the given name.
+
+=back
+
+=head2 Phisical layout specifications.
+
+=over 4
+
+=item B<paper> I<size>
+
+The paper size for this entry.
+Default value is `a4'.
+
+=item I<orientation>
+
+This can be B<portrait>, B<landscape>, B<upsidedown> and B<seascape>.
+Default orientation is `portrait'.
+
+Note that rows, columns and margins are all relative to the selected
+page orientation.
+
+=item B<rows> I<NN>
+
+The number of rows of labels on a sheet.
+Default is 1 row.
+
+=item B<cols> I<NN>
+
+The number of columns on a sheet.
+Default is 1 column.
+
+The dimensions of the labels are calculated from the paper size and
+the number of rows and columns. For example, with A4 paper and 7
+rows of 3 columns, each label is 70 mm wide and 42.4 mm high.
+
+=item B<topmargin> I<NN>
+
+Optional margin on the top of each sheet. For sheets that are not
+completely composed of labels.
+
+=item B<bottommargin> I<NN>
+
+Optional margin on the bottom of each sheet.
+
+=item B<keftmargin> I<NN>
+
+Optional margin on the left of each sheet.
+
+=item B<rightmargin> I<NN>
+
+Optional margin on the right of each sheet.
+
+=back
+
+=head2 Placement of the text on the labels.
+
+=over 4
+
+=item B<left> I<NN>
+
+The offset, in millimeters, of the printed text from the left edge of
+each label. Default value is zero, which is not what you want.
+
+=item B<top> I<NN>
+
+The offset, in millimeters, of the baseline of the first line of
+printed text from the top edge of each label. 
+Default value is zero, which is probably not what you want unless
+B<vcenter> is also included in this specification.
+
+=item B<vcenter>
+
+The lines of text on the label are vertically centered. If B<top> was
+specified, the remaining vertical space is used for centering.
+
+Centering is nice for labels, but usually not desired for envelopes.
+
+=back
+
+=head2 Non-standard page sizes
+
+For non-standard page sizes, for example for envelopes, two
+approaches are possible.
+
+The first approach is to pretend a common paper size, e.g. `a4', and
+define margins to reposition the envelope on the paper.
+
+For example
+
+    # Envelope A6, landscape, on A4 paper
+    type e6
+      paper a4
+      landscape
+      leftmargin 134
+      bottommargin 97
+      left 70
+      top 60
+
+The second approach is to explicitly specify the paper dimensions.
+Disadvantage is that some PostScript viewers cannot handle this
+correctly (GhostScript does it okay, GhostView does not).
+
+For example:
+
+    # Envelope A6, landscape
+    paper _a6l 148.5 105  # width > height implies landscape
+    type xa6
+      paper _a6l
+      left 70
+      top 60
+
+=head1 THE INPUT TEXT
+
+The input is considered to be made up of text lines, each of which are
+printed on the labels. The encoding used is ISO-Latin-1.
+
+A text line that starts with a double slash is printed using an italic
+font (after removing the slashes). A text line that starts with a
+double bar is printed using a bold font (after removing the bars). A
+text line that starts with bar-slash or slash-bar is printed using a
+bold-italic font (after removing the bar and slash).
+
+In the text, the following substitutions are made:
+
+=over 4
+
+=item *
+
+Three consecutive periods are printed as an ellipsis.
+
+=item *
+
+Three consecutive minus signs are printed as a long dash.
+
+=item *
+
+Two consecutive minus signs are printed as a medium dash.
+
+=item *
+
+Straight quotes C<'> and C<"> are printed as curly quotes.
+
+=item *
+
+Octal codes \336 and \320 are printed as a straight single / double
+quite. Deprecated.
+
+=back
+
+The program recognises dutch zip codes and will print a KIX barcode
+under the address if it can distill the KIX code from the address.
+If this fails, the KIX code can be specified explicitly as the last
+line of the input. For example, the following two entries produce
+identical results:
+
+    H.J. Hekking
+    Dorpsstraat 5
+    1234 AB  Juinen
+
+    H.J. Hekking
+    Dorpsstraat 5
+    1234 AB  Juinen
+    1234AB5
+
+In the second entry, the KIX code was explicitly specified.
+
+The program will issue a warning if it could not determine the KIX
+code from the address.
+
+KIX code processing can be suppressed with the B<-nokix> command line
+option.
+
+=head1 THE OUTPUT POSTSCRIPT DOCUMENT
+
+The generated PostScript output is conformant to Adobe Structuring
+Conventions version 3.0.
+
+The fonts required for printing are not included in the PostScript
+output. If you use non-standard PostScript fonts, you will need a
+print spooler that is capable of providing the necessary fonts to the
+printer. Alternatively, the font files can be inserted in the
+PostScript preamble that follows the program text.
+
+=head1 BUGS AND DEFICIENCIES
+
+There is no protection against text running off the label, if the text
+is too long.
+
+Fonts and font sizes are hard-wired.
+
+=head1 AUTHOR AND CREDITS
+
+Johan Vromans (jvromans@squirrel.nl) wrote the program.
+
+The KIX code font included in the kit is created by Hendrik Jan
+Thomassen <H.J.Thomassen@ATComputing.nl>.
+
+=head1 COPYRIGHT AND DISCLAIMER
+
+This program is Copyright 1992,1999 by Squirrel Consultancy. All
+rights reserved.
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of either: a) the GNU General Public License as
+published by the Free Software Foundation; either version 1, or (at
+your option) any later version, or b) the "Artistic License" which
+comes with Perl.
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See either the
+GNU General Public License or the Perl Artistic License for details.
+
+=cut
+
+__END__
+%!PS-Adobe-3.0
+%%Creator: Johan Vromans
+%%Title: (Labels)
+%%Pages: (atend)
+%%DocumentSuppliedResources: procset label 0 0
+%%+ font FONTLIST
+%%+ font KIX-Barcode-Regular
+%%EndComments
+%%BeginResource: procset label 0 0
+/WorkDict 20 dict def
+WorkDict begin
+%/ISOLatin1Encoding where { pop save true }{ false } ifelse
+%  /ISOLatin1Encoding [ StandardEncoding 0 45 getinterval aload pop /minus
+%    StandardEncoding 46 98 getinterval aload pop /dotlessi /grave /acute
+%    /circumflex /tilde /macron /breve /dotaccent /dieresis /.notdef /ring
+%    /cedilla /.notdef /hungarumlaut /ogonek /caron /space /exclamdown /cent
+%    /sterling /currency /yen /brokenbar /section /dieresis /copyright
+%    /ordfeminine /guillemotleft /logicalnot /hyphen /registered /macron
+%    /degree /plusminus /twosuperior /threesuperior /acute /mu /paragraph
+%    /periodcentered /cedilla /onesuperior /ordmasculine /guillemotright
+%    /onequarter /onehalf /threequarters /questiondown /Agrave /Aacute
+%    /Acircumflex /Atilde /Adieresis /Aring /AE /Ccedilla /Egrave /Eacute
+%    /Ecircumflex /Edieresis /Igrave /Iacute /Icircumflex /Idieresis /Eth
+%    /Ntilde /Ograve /Oacute /Ocircumflex /Otilde /Odieresis /multiply
+%    /Oslash /Ugrave /Uacute /Ucircumflex /Udieresis /Yacute /Thorn
+%    /germandbls /agrave /aacute /acircumflex /atilde /adieresis /aring /ae
+%    /ccedilla /egrave /eacute /ecircumflex /edieresis /igrave /iacute
+%    /icircumflex /idieresis /eth /ntilde /ograve /oacute /ocircumflex
+%    /otilde /odieresis /divide /oslash /ugrave /uacute /ucircumflex
+%    /udieresis /yacute /thorn /ydieresis ] def
+%{ restore } if
+FONTPREAMBLE
+% Shorthand defintions.
+/m   { moveto    } def
+/rl  { rlineto   } def
+/cpf { closepath fill } def
+/cps { closepath stroke } def
+/kix { fx setfont show } def
+/layout { } def
+end
+%%EndResource
+%%IncludeResource: font FONTLIST
+%%BeginResource: font KIX-Barcode-Regular
+%!FontType1-1.0 KIX-Barcode-Regular 002.000
+%%VMusage: 6650 6000
+% Created by <hjt@ATComputing.nl> Donated to the public domain.
+20 dict begin
+/FontInfo 16 dict dup begin
+  /version (002.000) readonly def
+  /Notice () readonly def
+  /FullName (KIX-Barcode-Regular) readonly def
+  /FamilyName (KIX-Barcode) readonly def
+  /Weight (Regular) readonly def
+  /ItalicAngle 0 def
+  /isFixedPitch true def
+  /UnderlinePosition  0 def
+  /UnderlineThickness 0 def
+  /descent 713 def
+  /em     1125 def
+  /ascent  716 def
+end readonly def
+
+/FontName  /KIX-Barcode-Regular def
+/Encoding  256 array def
+  0    1 255 { Encoding exch /.notdef put } for
+  /A/B/C/D/E/F/G/H/I/J/K/L/M/N/O/P/Q/R/S/T/U/V/W/X/Y/Z
+  122 -1 97  { Encoding exch 2 index put pop } for
+  /A/B/C/D/E/F/G/H/I/J/K/L/M/N/O/P/Q/R/S/T/U/V/W/X/Y/Z
+   90 -1 65  { Encoding exch 2 index put pop } for
+  /zero/one/two/three/four/five/six/seven/eight/nine
+   57 -1 48 { Encoding exch 2 index put pop } for
+/PaintType   0 def
+/FontType    1 def
+/FontMatrix [0.001 0 0 0.001 0 0] readonly def
+/FontBBox   {0 -713 1125 716} readonly def
+/UniqueID    5094222 def
+/StrokeWidth 0 def
+currentdict end
+
+currentfile eexec
+D8054DA81523D21BE0E68D9C0E470A90FA8043F3E469DC9BA779353B32E969729A2AB5B5
+409916E0EF4C8AE5E999197190EE374C92C36E467EC32D8388668A7BEC5250F8456341CA
+0A522C801CA16A5A991168368978F4D224CEFEE52324A9C08339E98732B0FA4EAEDE0B63
+839C126ED999D5203CDF3FA6FE92EEDAEC04940BA621111137E625E4D18CC5AC201079CD
+C59579DAF345F99083024D791F08F00A95A9E0CA962BE3830A6FE988E2EAB1B40D48757C
+5DEBB2A47B77D8F02CD14ADFDC328E5F567C24D6E742B0D04E0531E26366DF660C4F9FE4
+2300182A8CE04BAADB62DF0C0905450D3570ACB66C3ABDA7AFE595BE78AFE37033D6C293
+F8D13DFB5A60D7952FE16D12C9104535A41388BC59356DF8F1428AF3461DDCE7CAFB4B12
+B93716759877151C8A0A468EF3512EDCAC9EAA01CCB4DF680C65B3CCB4A8F4994AD220D0
+A999A51A5F424ED1EBC056A9DC4D323C3251B0B503D3C810AFFD1949E98EF35323D6871B
+67D0FE825C28D414A31126492A9CBDFC36B5A57C2057F35456C215036AA9A4A0B1D9DDE8
+5493C79745388925DEBA38F69E610BE457E098F35D9623110FB41F8C1DBE1A3FCB1FC8FC
+A2C124B89AC4236954B7E92F403AE514B5D501F601A9528D440EF5787BEBB4EF30116800
+69AEE48E9609F4EA1E06811BD7520881939745F817BDA5F87961361C02F54E252E8988EA
+9401476BE68E839DD0AA32265B56270A536F3C42E906636C3B2A1A39A1AD5B662E6FA882
+C8879A7B6FA2998607C8B50BA6EEA727AE5754B47FC724FBC620858C9AEA09801E884FAF
+B1459CA2B9A4419E4B5AA112E37F7F6C0DCFDEC168D144F05C650C128DB018D495A5D061
+DEDD1A7E62AE9F9598D855522CAB932B1238DF1E86A7D632F7225C2AFC8C035E42861B23
+4AF4CA2CE9773A1A5E5E01961EC7D71E8BB8BABE394AF7EE711BEFAE4397FDE0AA549F95
+ADE842542F7F6D72875E956601BFFFF06D9481B3D8F164EFF54CEA9FADE692E20EB288FD
+37D056392171499DC69AB5AE4D50280350405A57FCC6F7869A9A9738EF773B4FFB8CC872
+2F4E98AB0CD92F9822500B7C06AE78212415F33BBAB1EEDD40BCC6D7537E9E6C3B48093A
+FA2B58FE1562F9E4B2E311B5FD68390FACF299AB4DDDB8AD17D09B1FD75D9484DF6DCAE6
+1D30F60159D624E216A69D8F9215A4E8085DDF227ABB36084D1646F45EA7DFC31D94B8D9
+C64C8E92EE6982C8CA2141B7F0E541D301F2533BECC298E6996F77E44D7531EDF4F00EDA
+E7EF5F11F62490F62C5C29BA7D2187A5A484857EC0A8C3A0A117883E23748E967D399FE3
+757066B7AC1D2FB3D74A0CE52395F46431A92E6B2274B45732CBCC880E989242A972D2E9
+6DC5705BED0EEEE911EF57CEA4CE8580BFD36FE16712EB641F0837F143EBAB7076F50A14
+6B6C99FA950CB66C37AE94CF115972B27F0E7A0766809BBDFC2D199DD6879593A2EEFC64
+9EAD184EDED136593D57AED62FD27FA04C4B0A7F5D89E91DDDBC2AD354D7CD88A607C535
+347E8A508403D9D51703F0EED93426033F93EDF8E5E880465F7A26DF5780BF98213DEA24
+1802EF4D045F55602EBCD7AD3131DF07C085C085D45D2510ED2138146B79D4F525E4FE03
+82E7E4340B7FCCFF1F03A5F9938338EDF2389A1C9C2117EEC719EE7F6ADE7FED129E4D25
+5DCB06DC77E37F5EF8DD23F2561CEA048E17DDD5EF71DAE5CA7B9643DB7E4EE577F71CF5
+85C9CD111E28B9A1BB2C49EC8CC641DE958E475FE800C5CD323BD1526C4CDA0898CF4197
+8D8FECB39A3D88F5597B05F6BEC0694AD8C5F6EB1D135EA080CBE6414248DD68078A9066
+FF102959298108DE7748DFC2DD720BA40D164AF50D4172E78B3D7F5414D50D8F1964EC10
+EDF50EE0BB86C59CC92FB84252E6F855EACFE13C98BCD188FF21B65E86AC7884D83191EE
+F524A204D6A331AB7960622B2831C37A22346CF090374759FAF1F8FA86DDF82C9AD5B0CD
+0ED783B69F8BAE877B67D3CB2CD5DD633C54637A80BA362A5B9C455B7BA9DEB4CBCCADFF
+6906251D53AC8977CC9E8FA42AB49A5F632BA21F9BD8AA4A3EED272491630CB9F34F33CB
+5634021D8A91463C8FA2F1672CD100259630036F87803541DCE793EE02711C2C4F80B0EF
+520CFA0E60E288382C38332C0DC4C6E173F8202573216FC66DCDEE2B3B2B11D8D004E88B
+BC1A8BB488C71257F7AF4EA8A7E85A86FC401B88D2CF05DD2CB064ECDF7EA8DE6526EDAC
+FD0AC7E3B8C1952DB9B7851F2C981BD7449405E0FCAB864A32228DC41FE28AFDD93FEB3B
+0F9ADAD6F2E80DDDB6C2C581FC4B1B984E55D43105DB72BB09AE5855B953ABA31A3EB1DF
+B3A0211851C0F991185D9C327A2FE84631131A120B685235E0C8CB87E4FC868F1BB9678E
+BB5B2A1383D088C8DAC7EB4F60E4F831BC00B1835CC8369A2D2642F4827220FA01A05920
+73280D3F347404204ABCC46696B111C69A88473AA788094E54B39ABF9081B8928B785405
+88EBE500D3F661426965552BA84476B17C1CFD946F3276FCB7C6E3D61877B6AE44C7A553
+4E70A4CBFE9A2F11D6A76908A7002D12990D2C4D0FA302B84DC52530769C6DF15E119CDD
+5FA1276C683A2672882518FC443315782B40E9D1877DC9795C9D1FC9A61A05B871338D9F
+8694F4E73880AA6449AD2DA664E0DD8FBDB8D615F6C366953EA2D16A54215A9B250CB5A8
+A6BA185ED8E19816DAC8DDF0E349BFE3CF335E497F6A325C034DA006CE094FE19327D6C3
+B7909B8A1306AB15D4E36A65C4497F79A54B23F3279D20F97CF6374B37E366216E749231
+488DEAB2059376758211F0742C9CE7418FFF1B45E9AD7481686D4D2EE1129D7AA85C739B
+D951D09F7E46C244C5B91E7FE63A8B49F059E9DE78358728F90141A9445570FEE4585CAE
+03084701833147C9A84E14CFA22E19F632E771EDFC463510EA66A4DDA2BB44CC9AA7AC1E
+B05B822DA725A04CC725DDABFCC711F7054140C59E0E9FB3AE361C3FF8D1BC9F749FE26E
+C2A077F7FC3DB14A7419CF2EE485A0942614B44FEED44373F9B28DE928155AD8E5DF3C9E
+CAD699D1B5574CA1FEB40140FF4BB29484120EC8C6494F94B0B9A9AA11359EDB14147C31
+077016A33E5E186C248A2227C15673709AC79A58C2AFA85BFC88B471F848BA801D83AF33
+21F5DA06067C93F96F464D2260C8722842B9199A545814BC2A3945271827C884CA69DFF4
+E2A9F74F092F9D9F0B577C06A394616FE738B3290C32C5C9579C435B04683D8EBAEB0FE8
+49E3771143EE8F2EFD0C10F4E4436E437E3B09272C9CAA12AF530283256B4592D7275E04
+96CD483CBB59960FBE1B6C3C93D41843189C389E03A56665C284CED0948FEAF59464784B
+144F82DB10BD48A7E32B51789647542785D74C85AAD62AB25EC9A1DD66F5AAE5D2A6C18C
+19AAD99D32D46135EDDCF5AD49C24B6010EB19048AC10BE541B27EBE4CFBD99E3FB06166
+A0FAC8CE7205C49A3B51C476291AD85956DDDD5C13F6DD20495C06416A585B3DD66002DE
+66AA85B0B10C80E06E32114AC362F123834406EE273E982838637F19FFB6AC5E442FADE8
+2ACAEEF802E89201121687C7ED1FD79424F031A2594C749B018A90D10E10DEF22CE41D65
+718D7EE884DDE7D39FFEAC563E1ACC5DEFA33BBA9B833914B7138216EF4AD5B1C2B05F84
+DEC2F944790F72F85C7085E1B54FAE455CFFDF7138A7FE2C09D73AF71255D0584F69EF82
+22DBA18B4DD5FB9D522200F44A0050817E
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+cleartomark
+%%EndResource
+%%EndProlog
+%%BeginSetup
+WorkDict begin
+FONTSETUPS
+/fx /KIX-Barcode-Regular findfont 10 scalefont def
+end
